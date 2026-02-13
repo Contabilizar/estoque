@@ -9,14 +9,18 @@ const app = express()
 app.use(express.json())
 app.use(cors())
 
-// 🔗 Conexão com banco
+// =============================
+// CONEXÃO BANCO
+// =============================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 })
 
-// 🗄 Criar tabelas automaticamente
-async function criarTabelas() {
+// =============================
+// CRIAR TABELAS AUTOMATICAMENTE
+// =============================
+async function iniciarBanco() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS funcionarios (
       id SERIAL PRIMARY KEY,
@@ -54,79 +58,140 @@ async function criarTabelas() {
     );
   `)
 
-  console.log("Tabelas verificadas/criadas com sucesso ✅")
-}
+  // Criar admin automaticamente se não existir
+  const admin = await pool.query(
+    "SELECT * FROM funcionarios WHERE login = 'admin'"
+  )
 
-criarTabelas()
-
-// 🏠 Rota principal
-app.get('/', (req, res) => {
-  res.send('API Controle Estoque rodando 🚀')
-})
-
-// 👤 Criar admin (executar UMA vez)
-app.get('/criar-admin', async (req, res) => {
-  try {
+  if (admin.rows.length === 0) {
     const senhaHash = await bcrypt.hash('123456', 10)
 
     await pool.query(
       `INSERT INTO funcionarios (nome, login, senha_hash, pin, setor)
-       VALUES ('Administrador', 'admin', $1, '0000', 'Administrativo')
-       ON CONFLICT (login) DO NOTHING`,
+       VALUES ('Administrador', 'admin', $1, '0000', 'Administrativo')`,
       [senhaHash]
     )
 
-    res.send('Admin criado com sucesso ✅')
-  } catch (err) {
-    console.error(err)
-    res.status(500).send('Erro ao criar admin')
+    console.log('Admin criado automaticamente ✅')
   }
+
+  console.log('Banco pronto ✅')
+}
+
+iniciarBanco()
+
+// =============================
+// MIDDLEWARE JWT
+// =============================
+function autenticarToken(req, res, next) {
+  const authHeader = req.headers['authorization']
+  const token = authHeader && authHeader.split(' ')[1]
+
+  if (!token) return res.status(401).json({ error: 'Token não enviado' })
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Token inválido' })
+    req.user = user
+    next()
+  })
+}
+
+// =============================
+// ROTA PRINCIPAL
+// =============================
+app.get('/', (req, res) => {
+  res.send('API Controle Estoque rodando 🚀')
 })
 
-app.get('/listar-usuarios', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT id, nome, login FROM funcionarios')
-    res.json(result.rows)
-  } catch (err) {
-    console.error(err)
-    res.status(500).send('Erro ao listar usuários')
-  }
-})
-
-// 🔐 Login
+// =============================
+// LOGIN
+// =============================
 app.post('/login', async (req, res) => {
   const { login, senha } = req.body
 
-  try {
-    const result = await pool.query(
-      'SELECT * FROM funcionarios WHERE login = $1',
-      [login]
-    )
+  const result = await pool.query(
+    'SELECT * FROM funcionarios WHERE login = $1',
+    [login]
+  )
 
-    if (result.rows.length === 0)
-      return res.status(401).json({ error: 'Usuário não encontrado' })
+  if (result.rows.length === 0)
+    return res.status(401).json({ error: 'Usuário não encontrado' })
 
-    const usuario = result.rows[0]
+  const usuario = result.rows[0]
+  const senhaValida = await bcrypt.compare(senha, usuario.senha_hash)
 
-    const senhaValida = await bcrypt.compare(senha, usuario.senha_hash)
+  if (!senhaValida)
+    return res.status(401).json({ error: 'Senha incorreta' })
 
-    if (!senhaValida)
-      return res.status(401).json({ error: 'Senha incorreta' })
+  const token = jwt.sign(
+    { id: usuario.id, nome: usuario.nome },
+    process.env.JWT_SECRET,
+    { expiresIn: '8h' }
+  )
 
-    const token = jwt.sign(
-      { id: usuario.id, nome: usuario.nome },
-      process.env.JWT_SECRET,
-      { expiresIn: '8h' }
-    )
-
-    res.json({ token })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Erro no servidor' })
-  }
+  res.json({ token })
 })
 
-// 🚀 Iniciar servidor
+// =============================
+// CADASTRAR ITEM
+// =============================
+app.post('/itens', autenticarToken, async (req, res) => {
+  const { nome, categoria, estoque_atual, estoque_minimo } = req.body
+
+  await pool.query(
+    `INSERT INTO itens (nome, categoria, estoque_atual, estoque_minimo)
+     VALUES ($1, $2, $3, $4)`,
+    [nome, categoria, estoque_atual, estoque_minimo]
+  )
+
+  res.json({ message: 'Item cadastrado com sucesso' })
+})
+
+// =============================
+// LISTAR ITENS
+// =============================
+app.get('/itens', autenticarToken, async (req, res) => {
+  const result = await pool.query('SELECT * FROM itens ORDER BY id DESC')
+  res.json(result.rows)
+})
+
+// =============================
+// RETIRADA COM PIN
+// =============================
+app.post('/retirada', autenticarToken, async (req, res) => {
+  const { item_id, quantidade, pin } = req.body
+
+  const funcionario = await pool.query(
+    'SELECT * FROM funcionarios WHERE id = $1',
+    [req.user.id]
+  )
+
+  if (funcionario.rows[0].pin !== pin)
+    return res.status(401).json({ error: 'PIN incorreto' })
+
+  await pool.query(
+    `INSERT INTO movimentacoes (funcionario_id, item_id, quantidade, tipo, ip, user_agent)
+     VALUES ($1, $2, $3, 'retirada', $4, $5)`,
+    [
+      req.user.id,
+      item_id,
+      quantidade,
+      req.ip,
+      req.headers['user-agent'],
+    ]
+  )
+
+  await pool.query(
+    `UPDATE itens
+     SET estoque_atual = estoque_atual - $1
+     WHERE id = $2`,
+    [quantidade, item_id]
+  )
+
+  res.json({ message: 'Retirada registrada com sucesso' })
+})
+
+// =============================
 app.listen(process.env.PORT || 3000, () =>
   console.log('Servidor rodando 🚀')
 )
