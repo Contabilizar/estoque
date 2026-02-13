@@ -1,5 +1,5 @@
 {
-  "name": "controle-estoque",
+  "name": "controle-estoque-api",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
